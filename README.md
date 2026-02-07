@@ -25,6 +25,10 @@
 ```bash
 sudo bash install-motd.sh
 ```
+Or
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/blueinx/debian-dynamic-motd/main/install-motd.sh)
+```
 
 Optional:
 ```bash
