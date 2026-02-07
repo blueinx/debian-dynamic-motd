@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# ========= 配置 =========
+VERSION="2026.02.07"
+
 UPDATE_DIR="/etc/update-motd.d"
 GEN_BIN="/usr/local/bin/update-motd"
+REFRESH_BIN="/usr/local/bin/motd-refresh"
 
 PAM_SSHD="/etc/pam.d/sshd"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
 CACHE_DIR="/var/cache/motd"
-REFRESH_BIN="/usr/local/bin/motd-refresh"
-
 UPD_META="${CACHE_DIR}/updates.meta"
 SEC_LIST="${CACHE_DIR}/security-updates.list"
-
 NR_META="${CACHE_DIR}/needrestart.meta"
 NR_SVCS="${CACHE_DIR}/needrestart.services"
 
@@ -22,189 +21,224 @@ TMR_UNIT="/etc/systemd/system/motd-refresh.timer"
 
 MARK_BEGIN="# BEGIN MOTD-UBUNTUISH"
 MARK_END="# END MOTD-UBUNTUISH"
-
 BACKUP_SUFFIX=".bak.$(date +%Y%m%d%H%M%S)"
 
-need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "请用 root 执行：sudo bash $0"
-    exit 1
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+warn() {
+  printf '[%s] WARN: %s\n' "$(date '+%F %T')" "$*" >&2
+}
+
+die() {
+  printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2
+  exit 1
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Run as root. Example: sudo bash $0"
   fi
 }
 
 backup_file() {
-  local f="$1"
-  if [[ -f "$f" ]]; then
-    cp -a "$f" "${f}${BACKUP_SUFFIX}"
-    echo "已备份：${f}${BACKUP_SUFFIX}"
+  local path="$1"
+  local backup=""
+
+  if [[ -f "$path" ]]; then
+    backup="${path}${BACKUP_SUFFIX}"
+    cp -a -- "$path" "$backup"
+    log "Backup created: $backup" >&2
+  fi
+  printf '%s\n' "$backup"
+}
+
+restore_file() {
+  local backup="$1"
+  local target="$2"
+  if [[ -n "$backup" && -f "$backup" ]]; then
+    cp -a -- "$backup" "$target"
+    log "Restored from backup: $target"
   fi
 }
 
-write_owned_file() {
-  # “我们自主管理”的文件：存在则备份，再覆盖
+write_owned_file_from_func() {
   local path="$1"
   local mode="$2"
-  local content="$3"
-  if [[ -e "$path" ]]; then backup_file "$path"; fi
-  install -d "$(dirname "$path")"
-  printf "%s" "$content" > "$path"
-  chmod "$mode" "$path"
-  echo "已写入：$path"
+  local content_func="$3"
+  local tmp=""
+
+  install -d -m 0755 "$(dirname "$path")"
+  tmp="$(mktemp "${path}.tmp.XXXXXX")"
+  "$content_func" > "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f -- "$tmp" "$path"
+  log "Wrote: $path"
 }
 
-upsert_sshd_kv() {
-  local key="$1"
-  local val="$2"
-  if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+" "$SSHD_CONFIG"; then
-    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|g" "$SSHD_CONFIG"
+try_install_needrestart() {
+  if have_cmd needrestart; then
+    return 0
+  fi
+  if ! have_cmd apt-get; then
+    warn "apt-get is unavailable. Skip needrestart installation."
+    return 1
+  fi
+
+  log "needrestart not found. Attempting install."
+  if DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -qq update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install needrestart >/dev/null; then
+    log "needrestart installed."
+    return 0
+  fi
+
+  warn "Failed to install needrestart. MOTD restart hints may be limited."
+  return 1
+}
+
+content_10_header() {
+  cat <<'EOF_10_HEADER'
+#!/usr/bin/env bash
+set -u
+
+os_pretty="Linux"
+if [[ -r /etc/os-release ]]; then
+  os_pretty="$(
+    . /etc/os-release
+    printf '%s' "${PRETTY_NAME:-Linux}"
+  )"
+fi
+
+kernel="$(uname -srmo 2>/dev/null || uname -sr 2>/dev/null || printf 'unknown')"
+arch="$(uname -m 2>/dev/null || printf 'unknown')"
+date_str="$(date 2>/dev/null || printf 'unknown')"
+
+echo
+echo "Welcome to ${os_pretty} (GNU/Linux ${kernel} ${arch})"
+echo
+echo " * Documentation:  https://www.debian.org/doc/"
+echo " * Support:        https://www.debian.org/support"
+echo
+echo " System information as of ${date_str}"
+echo
+EOF_10_HEADER
+}
+
+content_50_sysinfo() {
+  cat <<'EOF_50_SYSINFO'
+#!/usr/bin/env bash
+set -u
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+load="N/A"
+if [[ -r /proc/loadavg ]]; then
+  load="$(awk '{print $1}' /proc/loadavg 2>/dev/null || printf 'N/A')"
+fi
+
+procs="$(ps -e --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')"
+users="$(who 2>/dev/null | wc -l | tr -d '[:space:]')"
+is_uint "$procs" || procs="0"
+is_uint "$users" || users="0"
+
+disk_line="$(df -hP / 2>/dev/null | awk 'NR==2{printf "%s of %s", $5, $2}')"
+[[ -n "$disk_line" ]] || disk_line="N/A"
+
+mem_pct="N/A"
+swap_pct="N/A"
+if have_cmd free; then
+  mem_pct="$(free 2>/dev/null | awk '/^Mem:/ { if ($2>0) printf "%d%%", ($3/$2)*100; else print "0%" }')"
+  swap_pct="$(free 2>/dev/null | awk '/^Swap:/ { if ($2>0) printf "%d%%", ($3/$2)*100; else print "0%" }')"
+  [[ -n "$mem_pct" ]] || mem_pct="N/A"
+  [[ -n "$swap_pct" ]] || swap_pct="N/A"
+fi
+
+iface=""
+if have_cmd ip; then
+  iface="$(ip route show default 2>/dev/null | awk 'NR==1{print $5; exit}')"
+fi
+if [[ -z "${iface}" && -r /proc/net/route ]]; then
+  iface="$(awk '$2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null || true)"
+fi
+[[ -n "$iface" ]] || iface="unknown"
+
+ipv4="N/A"
+ipv6="N/A"
+if have_cmd ip && [[ "$iface" != "unknown" ]]; then
+  ipv4="$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)"
+  ipv6="$(ip -6 addr show "$iface" scope global 2>/dev/null | awk '/inet6 /{print $2; exit}' | cut -d/ -f1)"
+  [[ -n "$ipv4" ]] || ipv4="N/A"
+  [[ -n "$ipv6" ]] || ipv6="N/A"
+fi
+
+echo
+printf "  System load:  %-16s Processes:             %s\n" "$load" "$procs"
+printf "  Usage of /:   %-16s Users logged in:       %s\n" "$disk_line" "$users"
+printf "  Memory usage: %-16s IPv4 address for %s: %s\n" "$mem_pct" "$iface" "$ipv4"
+printf "  Swap usage:   %-16s IPv6 address for %s: %s\n" "$swap_pct" "$iface" "$ipv6"
+echo
+EOF_50_SYSINFO
+}
+
+content_60_updates() {
+  cat <<'EOF_60_UPDATES'
+#!/usr/bin/env bash
+set -u
+
+meta="/var/cache/motd/updates.meta"
+nr_meta="/var/cache/motd/needrestart.meta"
+nr_svcs="/var/cache/motd/needrestart.services"
+max_age=$((3 * 24 * 3600))
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+read_kv() {
+  local file="$1"
+  local key="$2"
+  awk -F= -v k="$key" '$1==k {print $2; exit}' "$file" 2>/dev/null || true
+}
+
+mtime_epoch() {
+  local file="$1"
+  stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0
+}
+
+is_fresh() {
+  local file="$1"
+  local now age epoch
+  [[ -f "$file" ]] || return 1
+  now="$(date +%s)"
+  epoch="$(read_kv "$file" generated_epoch)"
+  if is_uint "$epoch"; then
+    age=$((now - epoch))
   else
-    printf "\n%s %s\n" "$key" "$val" >> "$SSHD_CONFIG"
+    epoch="$(mtime_epoch "$file")"
+    is_uint "$epoch" || return 1
+    age=$((now - epoch))
   fi
-  echo "已设置 sshd_config：${key} ${val}"
+  (( age >= 0 && age <= max_age ))
 }
 
-patch_pam_sshd() {
-  backup_file "$PAM_SSHD"
-  local tmp
-  tmp="$(mktemp)"
+if is_fresh "$meta"; then
+  total="$(read_kv "$meta" total)"
+  sec="$(read_kv "$meta" security)"
+  is_uint "$total" || total="0"
+  is_uint "$sec" || sec="0"
 
-  # 策略：
-  # 1) 删除旧标记块
-  # 2) 删除可能造成重复显示的 pam_motd/pam_lastlog/我们的 pam_exec(update-motd)
-  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
-    BEGIN { skip=0 }
-    $0 ~ "^"b { skip=1; next }
-    $0 ~ "^"e { skip=0; next }
-    skip==1 { next }
-
-    $0 ~ /pam_motd\.so/ { next }
-    $0 ~ /pam_lastlog\.so/ { next }
-    ($0 ~ /pam_exec\.so/ && $0 ~ /\/usr\/local\/bin\/update-motd/) { next }
-
-    { print }
-  ' "$PAM_SSHD" > "$tmp"
-
-  cat >> "$tmp" <<EOF2
-
-${MARK_BEGIN}
-# 上次登录时间/来源 IP（Last login ... from ...）
-session required pam_lastlog.so
-
-# 生成动态 MOTD 到 /run/motd.dynamic
-session optional pam_exec.so /usr/local/bin/update-motd
-
-# 显示动态 MOTD
-session optional pam_motd.so motd=/run/motd.dynamic
-${MARK_END}
-EOF2
-
-  mv "$tmp" "$PAM_SSHD"
-  chmod 644 "$PAM_SSHD"
-  echo "已更新：$PAM_SSHD"
-}
-
-restart_ssh() {
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.service'; then
-    systemctl restart ssh
-  elif systemctl list-unit-files 2>/dev/null | grep -qE '^sshd\.service'; then
-    systemctl restart sshd
-  else
-    systemctl restart ssh || systemctl restart sshd || true
-  fi
-  echo "已重启 SSH 服务"
-}
-
-ensure_pkg() {
-  local cmd="$1"
-  local pkg="$2"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "==> 安装依赖：$pkg"
-    apt-get update -y
-    apt-get install -y "$pkg"
-  fi
-}
-
-need_root
-
-# 需要 needrestart（用于“服务/系统需重启建议”）
-ensure_pkg needrestart needrestart
-
-echo "==> 1) 创建动态 MOTD 目录"
-install -d -m 755 "$UPDATE_DIR"
-
-echo "==> 2) 写入 10-header"
-write_owned_file "$UPDATE_DIR/10-header" 755 \
-'#!/bin/bash
-set -e
-
-OS_PRETTY="$(. /etc/os-release; echo "$PRETTY_NAME")"
-KERNEL="$(uname -srmo 2>/dev/null || uname -sr)"
-ARCH="$(uname -m)"
-DATE_STR="$(date)"
-
-DOC_URL="https://www.debian.org/doc/"
-SUPPORT_URL="https://www.debian.org/support"
-
-echo
-echo "Welcome to ${OS_PRETTY} (GNU/Linux ${KERNEL} ${ARCH})"
-echo
-echo " * Documentation:  ${DOC_URL}"
-echo " * Support:        ${SUPPORT_URL}"
-echo
-echo " System information as of ${DATE_STR}"
-echo
-'
-
-echo "==> 3) 写入 50-sysinfo（IPv4 + IPv6）"
-write_owned_file "$UPDATE_DIR/50-sysinfo" 755 \
-'#!/bin/bash
-set -e
-
-LOAD="$(cut -d " " -f1 /proc/loadavg)"
-PROCS="$(ps -e --no-headers | wc -l)"
-USERS="$(who | wc -l)"
-
-DISK_LINE="$(df -h / | awk '\''NR==2{printf "%s of %s", $5, $2}'\'')"
-MEM_PCT="$(free | awk '\''/Mem:/ {printf "%d", ($3/$2)*100}'\'')"
-SWAP_PCT="$(free | awk '\''/Swap:/ { if ($2==0) {print "0"} else {printf "%d", ($3/$2)*100} }'\'')"
-
-IFACE="$(ip route 2>/dev/null | awk '\''/default/ {print $5; exit}'\'')"
-[ -z "$IFACE" ] && IFACE="eth0"
-
-IPV4="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '\''/inet /{print $2}'\'' | cut -d/ -f1 | head -n1)"
-[ -z "$IPV4" ] && IPV4="N/A"
-
-IPV6="$(ip -6 addr show "$IFACE" scope global 2>/dev/null | awk '\''/inet6 /{print $2}'\'' | cut -d/ -f1 | head -n1)"
-[ -z "$IPV6" ] && IPV6="N/A"
-
-echo
-printf "  System load:  %-16s Processes:             %s\n" "$LOAD" "$PROCS"
-printf "  Usage of /:   %-16s Users logged in:       %s\n" "$DISK_LINE" "$USERS"
-printf "  Memory usage: %-16s IPv4 address for %s: %s\n" "${MEM_PCT}%" "$IFACE" "$IPV4"
-printf "  Swap usage:   %-16s IPv6 address for %s: %s\n" "${SWAP_PCT}%" "$IFACE" "$IPV6"
-echo
-'
-
-echo "==> 4) 写入 60-updates（方案 X：总更新 + 安全更新；needrestart 摘要）"
-write_owned_file "$UPDATE_DIR/60-updates" 755 \
-'#!/bin/bash
-set -e
-
-META="/var/cache/motd/updates.meta"
-NR_META="/var/cache/motd/needrestart.meta"
-NR_SVCS="/var/cache/motd/needrestart.services"
-
-# 仅展示最近 3 天内刷新过的缓存（避免离线太久误导）
-if [ -f "$META" ] && find "$META" -mtime -3 >/dev/null 2>&1; then
-  total="$(awk -F= "/^total=/{print \$2}" "$META" 2>/dev/null || true)"
-  sec="$(awk -F= "/^security=/{print \$2}" "$META" 2>/dev/null || true)"
-
-  total="${total:-0}"
-  sec="${sec:-0}"
-
-  if [ "$total" -gt 0 ]; then
+  if (( total > 0 )); then
     echo "${total} update(s) can be applied immediately."
-    if [ "$sec" -gt 0 ]; then
+    if (( sec > 0 )); then
       echo "${sec} of these updates are security updates."
     fi
     echo "To see these additional updates run: apt list --upgradable"
@@ -212,203 +246,419 @@ if [ -f "$META" ] && find "$META" -mtime -3 >/dev/null 2>&1; then
   fi
 fi
 
-# needrestart 摘要（只在需要时显示）
-if [ -f "$NR_META" ] && find "$NR_META" -mtime -3 >/dev/null 2>&1; then
-  ksta="$(awk -F= "/^ksta=/{print \$2}" "$NR_META" 2>/dev/null || true)"
-  ksta="${ksta:-0}"
+if is_fresh "$nr_meta"; then
+  ksta="$(read_kv "$nr_meta" ksta)"
+  is_uint "$ksta" || ksta="0"
 
-  # ksta: 1=无; 2=ABI兼容升级待应用(建议重启); 3=版本升级待应用(需要重启)
-  if [ "$ksta" -eq 3 ]; then
+  if (( ksta == 3 )); then
     echo "*** System restart required ***"
     echo
-  elif [ "$ksta" -eq 2 ]; then
+  elif (( ksta == 2 )); then
     echo "System restart recommended."
     echo
   fi
 
-  if [ -s "$NR_SVCS" ]; then
-    n="$(wc -l < "$NR_SVCS" | tr -d " ")"
+  if [[ -s "$nr_svcs" ]]; then
+    n="$(wc -l < "$nr_svcs" | tr -d '[:space:]')"
+    is_uint "$n" || n="0"
     echo "Service restart required: ${n} service(s) should be restarted."
     echo "Services:"
-    sed "s/^/  - /" "$NR_SVCS" | head -n 12
-    [ "$n" -gt 12 ] && echo "  - (and more...)"
+    sed 's/^/  - /' "$nr_svcs" | head -n 12
+    (( n > 12 )) && echo "  - (and more...)"
     echo
   fi
 fi
-'
+EOF_60_UPDATES
+}
 
-echo "==> 5) 写入 80-reboot-required（兼容 /run/reboot-required；避免与 needrestart 重复刷屏）"
-write_owned_file "$UPDATE_DIR/80-reboot-required" 755 \
-'#!/bin/bash
-set -e
+content_80_reboot_required() {
+  cat <<'EOF_80_REBOOT'
+#!/usr/bin/env bash
+set -u
 
-NR_META="/var/cache/motd/needrestart.meta"
+nr_meta="/var/cache/motd/needrestart.meta"
 ksta="0"
-if [ -f "$NR_META" ]; then
-  ksta="$(awk -F= "/^ksta=/{print \$2}" "$NR_META" 2>/dev/null || echo 0)"
+if [[ -f "$nr_meta" ]]; then
+  ksta="$(awk -F= '$1=="ksta" {print $2; exit}' "$nr_meta" 2>/dev/null || echo 0)"
+fi
+[[ "$ksta" =~ ^[0-9]+$ ]] || ksta="0"
+
+if [[ "$ksta" == "3" ]]; then
+  exit 0
 fi
 
-# 如果 needrestart 已经判定“必须重启”(ksta=3)，这里就不再重复输出
-[ "$ksta" = "3" ] && exit 0
-
-REQ=""
-PKGS=""
-
-if [ -f /run/reboot-required ]; then
-  REQ="/run/reboot-required"
-  [ -f /run/reboot-required.pkgs ] && PKGS="/run/reboot-required.pkgs"
-elif [ -f /var/run/reboot-required ]; then
-  REQ="/var/run/reboot-required"
-  [ -f /var/run/reboot-required.pkgs ] && PKGS="/var/run/reboot-required.pkgs"
+req=""
+pkgs=""
+if [[ -f /run/reboot-required ]]; then
+  req="/run/reboot-required"
+  [[ -f /run/reboot-required.pkgs ]] && pkgs="/run/reboot-required.pkgs"
+elif [[ -f /var/run/reboot-required ]]; then
+  req="/var/run/reboot-required"
+  [[ -f /var/run/reboot-required.pkgs ]] && pkgs="/var/run/reboot-required.pkgs"
 fi
 
-if [ -n "$REQ" ]; then
+if [[ -n "$req" ]]; then
   echo "*** System restart required ***"
-  if [ -n "$PKGS" ]; then
+  if [[ -n "$pkgs" ]]; then
     echo "Packages requiring reboot:"
-    sed "s/^/  - /" "$PKGS" | head -n 20
+    sed 's/^/  - /' "$pkgs" | head -n 20
   fi
   echo
 fi
-'
+EOF_80_REBOOT
+}
 
-echo "==> 6) 写入 MOTD 生成器 /usr/local/bin/update-motd"
-write_owned_file "$GEN_BIN" 755 \
-'#!/bin/bash
-set -e
-OUT="/run/motd.dynamic"
-tmp="$(mktemp)"
+content_update_motd() {
+  cat <<'EOF_UPDATE_MOTD'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+out="/run/motd.dynamic"
+tmp="$(mktemp "${out}.tmp.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+LC_ALL=C
 for f in /etc/update-motd.d/*; do
-  [ -x "$f" ] && "$f" >> "$tmp"
+  [[ -x "$f" && -f "$f" ]] || continue
+  "$f" >> "$tmp" 2>/dev/null || true
 done
-mv "$tmp" "$OUT"
-chmod 644 "$OUT"
-'
 
-echo "==> 7) 写入缓存刷新脚本 /usr/local/bin/motd-refresh（更新摘要 + needrestart）"
-install -d -m 755 "$CACHE_DIR"
+chmod 0644 "$tmp"
+mv -f -- "$tmp" "$out"
+trap - EXIT
+EOF_UPDATE_MOTD
+}
 
-write_owned_file "$REFRESH_BIN" 755 \
-'#!/bin/bash
-set -euo pipefail
+content_motd_refresh() {
+  cat <<'EOF_REFRESH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-CACHE_DIR="/var/cache/motd"
-META_TMP="$(mktemp)"
-SECLIST_TMP="$(mktemp)"
-NRMETA_TMP="$(mktemp)"
-NRSVCS_TMP="$(mktemp)"
+cache_dir="/var/cache/motd"
+upd_meta="${cache_dir}/updates.meta"
+sec_list="${cache_dir}/security-updates.list"
+nr_meta="${cache_dir}/needrestart.meta"
+nr_svcs="${cache_dir}/needrestart.services"
 
-UPD_META="${CACHE_DIR}/updates.meta"
-SEC_LIST="${CACHE_DIR}/security-updates.list"
-NR_META="${CACHE_DIR}/needrestart.meta"
-NR_SVCS="${CACHE_DIR}/needrestart.services"
+meta_tmp="$(mktemp)"
+seclist_tmp="$(mktemp)"
+nrmeta_tmp="$(mktemp)"
+nrsvcs_tmp="$(mktemp)"
+cleanup() {
+  rm -f "$meta_tmp" "$seclist_tmp" "$nrmeta_tmp" "$nrsvcs_tmp"
+}
+trap cleanup EXIT
 
-mkdir -p "$CACHE_DIR"
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
 
-APT_OPTS=(
-  "-o" "Acquire::Retries=3"
-  "-o" "DPkg::Lock::Timeout=30"
-  "-qq"
-)
+mkdir -p "$cache_dir"
+chmod 0755 "$cache_dir"
 
-# ---- 更新摘要（总更新 + 安全更新）----
-# 如果 apt-get update 失败，则保留旧缓存，不覆盖
-if apt-get update "${APT_OPTS[@]}"; then
-  SIM="$(apt-get -s upgrade 2>/dev/null || true)"
+if command -v apt-get >/dev/null 2>&1; then
+  apt_opts=(
+    "-o" "Acquire::Retries=3"
+    "-o" "DPkg::Lock::Timeout=30"
+    "-qq"
+  )
+  if DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" update; then
+    sim="$(DEBIAN_FRONTEND=noninteractive apt-get -s -o Debug::NoLocking=true upgrade 2>/dev/null || true)"
 
-  total="$(printf "%s\n" "$SIM" | awk '\''/^Inst /{c++} END{print c+0}'\'')"
-  security="$(printf "%s\n" "$SIM" | awk '\''/^Inst / && $0 ~ /(Debian-Security|bookworm-security|security\.debian\.org)/{c++} END{print c+0}'\'')"
+    total="$(printf '%s\n' "$sim" | awk '/^Inst /{c++} END{print c+0}')"
+    security="$(printf '%s\n' "$sim" | awk '/^Inst / && tolower($0) ~ /security/{c++} END{print c+0}')"
+    is_uint "$total" || total="0"
+    is_uint "$security" || security="0"
 
-  printf "%s\n" "$SIM" \
-    | awk '\''/^Inst / && $0 ~ /(Debian-Security|bookworm-security|security\.debian\.org)/{print $2}'\'' \
-    | sort -u > "$SECLIST_TMP" || true
-
-  {
-    echo "total=${total}"
-    echo "security=${security}"
-    echo "generated=$(date -Is)"
-  } > "$META_TMP"
-
-  chmod 644 "$META_TMP" "$SECLIST_TMP"
-  mv "$META_TMP" "$UPD_META"
-  mv "$SECLIST_TMP" "$SEC_LIST"
-else
-  rm -f "$META_TMP" "$SECLIST_TMP" || true
+    printf '%s\n' "$sim" | awk '/^Inst / && tolower($0) ~ /security/{print $2}' | sort -u > "$seclist_tmp" || true
+    {
+      echo "total=${total}"
+      echo "security=${security}"
+      echo "generated=$(date -Is)"
+      echo "generated_epoch=$(date +%s)"
+    } > "$meta_tmp"
+    chmod 0644 "$meta_tmp" "$seclist_tmp"
+    mv -f -- "$meta_tmp" "$upd_meta"
+    mv -f -- "$seclist_tmp" "$sec_list"
+  fi
 fi
 
-# ---- needrestart 摘要（批处理 list-only）----
-# 输出为 NEEDRESTART-* 机器可读行（batch mode）+ list only
-OUT="$(needrestart -b -r l 2>/dev/null || true)"
+out=""
+if command -v needrestart >/dev/null 2>&1; then
+  out="$(needrestart -b -r l 2>/dev/null || true)"
+fi
 
-ksta="$(printf "%s\n" "$OUT" | awk -F': *' '\''/^NEEDRESTART-KSTA:/{print $2; exit}'\'' | tr -d "\r")"
-kcur="$(printf "%s\n" "$OUT" | awk -F': *' '\''/^NEEDRESTART-KCUR:/{print $2; exit}'\'' | tr -d "\r")"
-kexp="$(printf "%s\n" "$OUT" | awk -F': *' '\''/^NEEDRESTART-KEXP:/{print $2; exit}'\'' | tr -d "\r")"
+ksta="$(printf '%s\n' "$out" | awk -F': *' '/^NEEDRESTART-KSTA:/{print $2; exit}' | tr -d '\r')"
+kcur="$(printf '%s\n' "$out" | awk -F': *' '/^NEEDRESTART-KCUR:/{print $2; exit}' | tr -d '\r')"
+kexp="$(printf '%s\n' "$out" | awk -F': *' '/^NEEDRESTART-KEXP:/{print $2; exit}' | tr -d '\r')"
+is_uint "$ksta" || ksta="0"
 
-: > "$NRSVCS_TMP"
-printf "%s\n" "$OUT" | awk -F': *' '\''/^NEEDRESTART-SVC:/{print $2}'\'' | tr -d "\r" | sort -u > "$NRSVCS_TMP" || true
-
+printf '%s\n' "$out" | awk -F': *' '/^NEEDRESTART-SVC:/{print $2}' | tr -d '\r' | sort -u > "$nrsvcs_tmp" || true
 {
-  echo "ksta=${ksta:-0}"
-  [ -n "${kcur:-}" ] && echo "kcur=${kcur}"
-  [ -n "${kexp:-}" ] && echo "kexp=${kexp}"
+  echo "ksta=${ksta}"
+  [[ -n "${kcur:-}" ]] && echo "kcur=${kcur}"
+  [[ -n "${kexp:-}" ]] && echo "kexp=${kexp}"
   echo "generated=$(date -Is)"
-} > "$NRMETA_TMP"
+  echo "generated_epoch=$(date +%s)"
+} > "$nrmeta_tmp"
 
-chmod 644 "$NRMETA_TMP" "$NRSVCS_TMP"
-mv "$NRMETA_TMP" "$NR_META"
-mv "$NRSVCS_TMP" "$NR_SVCS"
-'
+chmod 0644 "$nrmeta_tmp" "$nrsvcs_tmp"
+mv -f -- "$nrmeta_tmp" "$nr_meta"
+mv -f -- "$nrsvcs_tmp" "$nr_svcs"
+EOF_REFRESH
+}
 
-echo "==> 8) 创建 systemd service + timer（后台定时刷新缓存）"
-write_owned_file "$SRV_UNIT" 644 \
-"[Unit]
+content_motd_service_unit() {
+  cat <<'EOF_MOTD_SERVICE'
+[Unit]
 Description=Refresh MOTD caches (updates + needrestart)
 Wants=network-online.target
 After=network-online.target
+ConditionPathExists=/usr/local/bin/motd-refresh
 
 [Service]
 Type=oneshot
-ExecStart=${REFRESH_BIN}
-"
+ExecStart=/usr/local/bin/motd-refresh
+Nice=10
+EOF_MOTD_SERVICE
+}
 
-write_owned_file "$TMR_UNIT" 644 \
-"[Unit]
+content_motd_timer_unit() {
+  cat <<'EOF_MOTD_TIMER'
+[Unit]
 Description=Periodic refresh of MOTD caches
 
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=12h
+RandomizedDelaySec=10min
 Persistent=true
 
 [Install]
 WantedBy=timers.target
-"
+EOF_MOTD_TIMER
+}
 
-systemctl daemon-reload
-systemctl enable --now motd-refresh.timer
-# 先手动刷新一次，保证立即有内容
-"$REFRESH_BIN" || true
+patch_pam_sshd() {
+  local tmp
+  tmp="$(mktemp "${PAM_SSHD}.tmp.XXXXXX")"
 
-echo "==> 9) 更新 PAM（Last login + MOTD，幂等写入）"
-patch_pam_sshd
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    BEGIN { skip=0 }
+    $0 == b { skip=1; next }
+    $0 == e { skip=0; next }
+    skip == 1 { next }
+    ($0 ~ /pam_exec\.so/ && $0 ~ /\/usr\/local\/bin\/update-motd/) { next }
+    ($0 ~ /pam_motd\.so/ && $0 ~ /motd=\/run\/motd\.dynamic/) { next }
+    { print }
+  ' "$PAM_SSHD" > "$tmp"
 
-echo "==> 10) 更新 sshd_config（UsePAM/PrintLastLog/PrintMotd）"
-backup_file "$SSHD_CONFIG"
-upsert_sshd_kv "UsePAM" "yes"
-upsert_sshd_kv "PrintLastLog" "yes"
-upsert_sshd_kv "PrintMotd" "no"
+  cat >> "$tmp" <<EOF_PAM_BLOCK
 
-echo "==> 11) 重启 SSH"
-restart_ssh
+${MARK_BEGIN}
+# Dynamic MOTD generated by /usr/local/bin/update-motd
+session optional pam_exec.so /usr/local/bin/update-motd
+session optional pam_motd.so motd=/run/motd.dynamic
+${MARK_END}
+EOF_PAM_BLOCK
 
-echo
-echo "✅ 完成！请【新开一个 SSH 会话】测试输出是否符合预期。"
-echo
-echo "你会看到类似 Ubuntu 的更新摘要："
-echo "  N update(s) can be applied immediately."
-echo "  S of these updates are security updates."
-echo "以及 needrestart 的提示（仅在需要时出现）："
-echo "  *** System restart required ***"
-echo "  Service restart required: ... Services: ..."
-echo
-echo "查看定时器：systemctl status motd-refresh.timer"
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$PAM_SSHD"
+  log "Updated: $PAM_SSHD"
+}
+
+upsert_sshd_global_option() {
+  local key="$1"
+  local val="$2"
+  local tmp=""
+
+  tmp="$(mktemp "${SSHD_CONFIG}.tmp.XXXXXX")"
+  awk -v key="$key" -v val="$val" '
+    BEGIN { in_match=0; done=0 }
+    /^[[:space:]]*Match([[:space:]]|$)/ {
+      if (!done) {
+        print key " " val
+        done=1
+      }
+      in_match=1
+      print
+      next
+    }
+    {
+      if (!in_match && $0 ~ "^[[:space:]]*#?[[:space:]]*" key "[[:space:]]+") {
+        if (!done) {
+          print key " " val
+          done=1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (!done) {
+        print key " " val
+      }
+    }
+  ' "$SSHD_CONFIG" > "$tmp"
+
+  mv -f -- "$tmp" "$SSHD_CONFIG"
+  log "Set sshd global option: ${key} ${val}"
+}
+
+validate_sshd_config() {
+  local sshd_bin=""
+  if [[ -x /usr/sbin/sshd ]]; then
+    sshd_bin="/usr/sbin/sshd"
+  elif have_cmd sshd; then
+    sshd_bin="$(command -v sshd)"
+  else
+    warn "sshd binary not found. Skipping sshd_config syntax validation."
+    return 0
+  fi
+
+  "$sshd_bin" -t -f "$SSHD_CONFIG" >/dev/null 2>&1
+}
+
+restart_ssh_service() {
+  local svc
+  if ! have_cmd systemctl || [[ ! -d /run/systemd/system ]]; then
+    warn "systemd is unavailable. Skip SSH service reload."
+    return 0
+  fi
+
+  for svc in ssh sshd ssh.service sshd.service; do
+    if systemctl reload "$svc" >/dev/null 2>&1 || systemctl restart "$svc" >/dev/null 2>&1; then
+      log "SSH service reloaded/restarted via: $svc"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+configure_motd_timer() {
+  if ! have_cmd systemctl || [[ ! -d /run/systemd/system ]]; then
+    warn "systemd is unavailable. Timer was written but not enabled."
+    return 0
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now motd-refresh.timer
+  log "Enabled timer: motd-refresh.timer"
+}
+
+write_managed_files() {
+  install -d -m 0755 "$UPDATE_DIR"
+  install -d -m 0755 "$CACHE_DIR"
+
+  write_owned_file_from_func "$UPDATE_DIR/10-header" 0755 content_10_header
+  write_owned_file_from_func "$UPDATE_DIR/50-sysinfo" 0755 content_50_sysinfo
+  write_owned_file_from_func "$UPDATE_DIR/60-updates" 0755 content_60_updates
+  write_owned_file_from_func "$UPDATE_DIR/80-reboot-required" 0755 content_80_reboot_required
+  write_owned_file_from_func "$GEN_BIN" 0755 content_update_motd
+  write_owned_file_from_func "$REFRESH_BIN" 0755 content_motd_refresh
+
+  write_owned_file_from_func "$SRV_UNIT" 0644 content_motd_service_unit
+  write_owned_file_from_func "$TMR_UNIT" 0644 content_motd_timer_unit
+}
+
+run_refresh_now() {
+  if [[ -x "$REFRESH_BIN" ]]; then
+    if "$REFRESH_BIN"; then
+      log "Refreshed MOTD caches once."
+    else
+      warn "Initial cache refresh failed. Existing caches (if any) were kept."
+    fi
+  fi
+}
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  install-motd.sh [--no-restart] [--version] [--help]
+
+Options:
+  --no-restart  Do not reload/restart SSH service at the end.
+  --version     Print script version.
+  --help        Show this help.
+EOF_USAGE
+}
+
+main() {
+  local no_restart=0
+  local sshd_backup=""
+  local pam_backup=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart)
+        no_restart=1
+        shift
+        ;;
+      --version)
+        echo "$VERSION"
+        exit 0
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  require_root
+
+  [[ -f "$PAM_SSHD" ]] || die "Missing file: $PAM_SSHD"
+  [[ -f "$SSHD_CONFIG" ]] || die "Missing file: $SSHD_CONFIG"
+
+  log "Starting MOTD installation (version ${VERSION})"
+  try_install_needrestart || true
+
+  write_managed_files
+  configure_motd_timer || warn "Could not enable motd-refresh.timer."
+  run_refresh_now
+
+  pam_backup="$(backup_file "$PAM_SSHD")"
+  sshd_backup="$(backup_file "$SSHD_CONFIG")"
+
+  patch_pam_sshd
+  upsert_sshd_global_option "UsePAM" "yes"
+  upsert_sshd_global_option "PrintLastLog" "yes"
+  upsert_sshd_global_option "PrintMotd" "no"
+
+  if ! validate_sshd_config; then
+    warn "sshd config validation failed. Rolling back SSH-related files."
+    restore_file "$pam_backup" "$PAM_SSHD"
+    restore_file "$sshd_backup" "$SSHD_CONFIG"
+    die "Aborted due to invalid sshd configuration."
+  fi
+
+  if [[ "$no_restart" -eq 0 ]]; then
+    if ! restart_ssh_service; then
+      warn "SSH reload/restart failed. Rolling back SSH-related files."
+      restore_file "$pam_backup" "$PAM_SSHD"
+      restore_file "$sshd_backup" "$SSHD_CONFIG"
+      restart_ssh_service || true
+      die "Aborted because SSH service could not be reloaded safely."
+    fi
+  else
+    log "Skipped SSH restart because --no-restart is set."
+  fi
+
+  cat <<EOF_DONE
+
+Completed.
+- Managed scripts: ${UPDATE_DIR}/10-header ${UPDATE_DIR}/50-sysinfo ${UPDATE_DIR}/60-updates ${UPDATE_DIR}/80-reboot-required
+- Generator: ${GEN_BIN}
+- Refresh script: ${REFRESH_BIN}
+- Cache files: ${UPD_META} ${SEC_LIST} ${NR_META} ${NR_SVCS}
+- Timer: motd-refresh.timer
+
+Next: open a new SSH session to verify output.
+EOF_DONE
+}
+
+main "$@"
